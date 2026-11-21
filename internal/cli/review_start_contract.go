@@ -78,6 +78,18 @@ func newReviewIntegrationStartResult(legacy ReviewFacadeStartResult, assessment 
 	if legacyTransport {
 		schema, contract = ReviewIntegrationStartSchemaV2, ReviewIntegrationContractV1
 	}
+	// A durable START can let the provider run every selected lens to a verdict
+	// before this envelope is rendered, so the authority it created may already
+	// be correction_required (or approved) here. The repository context, the
+	// status continuation and one artifact subject per lens exist only while
+	// the authority is still reviewing, which is exactly what Validate
+	// enforces; publishing them for a provider-run completed START turned a
+	// successful review into candidate_context_unavailable.
+	reviewing := legacy.State == reviewtransaction.StateReviewing &&
+		(legacy.Action == "created" || legacy.Action == "resumed" || legacy.Action == "replayed")
+	if !reviewing {
+		repositoryContext, nextTransition = nil, nil
+	}
 	result := ReviewIntegrationStartResult{
 		Schema: schema, Contract: contract, Operation: "review.start",
 		Action: legacy.Action, LensesRequired: legacy.LensesRequired, LineageID: legacy.LineageID,

@@ -1187,6 +1187,121 @@ func TestNegotiatedReviewStartSchemaAndFixtureAreStrict(t *testing.T) {
 	}
 }
 
+// TestNegotiatedReviewStartCompletedAuthorityPublishesOnlyItsTerminalState
+// pins the envelope of a durable START whose reviewers ran inside the provider
+// (review-start-completed-envelope): the whole review can finish before the
+// façade renders its result, so the authority is already correction_required
+// while the caller still holds the frozen candidate context, the capture-phase
+// repository context and the v4 status continuation. The envelope must publish
+// the authority's real terminal state and none of those reviewing-only fields,
+// which Validate accepts only while the authority is still reviewing.
+func TestNegotiatedReviewStartCompletedAuthorityPublishesOnlyItsTerminalState(t *testing.T) {
+	reviewEnabledHome(t)
+	repo := initReviewCLIRepo(t)
+	writeReviewStartCandidate(t, repo, "tracked.txt", "candidate\n", 0o644)
+	const lineage = "review-start-provider-completed"
+	created := runNegotiatedReviewStart(t, repo, lineage)
+	if created.State != reviewtransaction.StateReviewing || created.RepositoryContext == nil ||
+		created.NextTransition == nil || len(created.ArtifactSubjects) != len(created.SelectedLenses) {
+		t.Fatalf("reviewing negotiated START = %#v", created)
+	}
+	store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewing, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).FrozenCandidateContext(context.Background(), reviewing.State.InitialSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The provider runs every selected lens to a verdict inside the same call
+	// the consumer made to START, so the authority is terminal by the time the
+	// envelope is rendered.
+	completeNegotiatedStartReview(t, repo, created, false)
+	completed, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State.State != reviewtransaction.StateCorrectionRequired {
+		t.Fatalf("provider-run authority state = %q", completed.State.State)
+	}
+
+	// These are exactly the two inputs the façade derives after the provider
+	// returns, so the fixture carries no hand-written identity.
+	handle, err := reviewtransaction.DeriveReviewRepositoryContextHandle(context.Background(), repo, reviewtransaction.ReviewRepositoryContextBinding{
+		LineageID: completed.State.LineageID, TargetIdentity: completed.State.InitialSnapshot.Identity,
+		Revision: completed.State.CapturePhaseRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryContext := &ReviewRepositoryContextReference{
+		Capability: reviewtransaction.ReviewRepositoryContextCapability, Handle: handle,
+		Revision: completed.State.CapturePhaseRevision, TargetIdentity: completed.State.InitialSnapshot.Identity,
+	}
+	nextTransition := reviewStartStatusContinuation(completed.State, completed.State.CapturePhaseRevision, "", handle)
+	if nextTransition == nil {
+		t.Fatal("provider-run START fixture has no status continuation")
+	}
+	assessment := reviewtransaction.RiskAssessment{
+		Level: created.RiskLevel, ChangedLines: created.ChangedLines, Reasons: created.RiskReasons,
+	}
+
+	t.Run("completed authority publishes only its terminal state", func(t *testing.T) {
+		legacy := reviewFacadeStartResultFor("created", true, completed.State)
+		result, err := newReviewIntegrationStartResult(legacy, assessment, completed.State.InitialSnapshot.Kind, &frozen, repositoryContext, nextTransition, ReviewIntegrationContractV2)
+		if err != nil {
+			t.Fatalf("provider-run START envelope: %v", err)
+		}
+		if result.State != reviewtransaction.StateCorrectionRequired || result.Action != "created" ||
+			result.LineageID != lineage || result.CorrectionBudget != legacy.CorrectionBudget || result.RiskLevel != legacy.RiskLevel {
+			t.Fatalf("provider-run START identity = %#v", result)
+		}
+		if result.RepositoryContext != nil || result.NextTransition != nil || len(result.ArtifactSubjects) != 0 {
+			t.Fatalf("provider-run START published reviewing-only fields = %#v", result)
+		}
+		payload, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields := reviewStartOutputFields(t, payload)
+		for _, reviewingOnly := range []string{"repository_context", "next_transition"} {
+			if _, present := fields[reviewingOnly]; present {
+				t.Fatalf("provider-run START serialized reviewing-only %q: %s", reviewingOnly, payload)
+			}
+		}
+		subjects, present := fields["artifact_subjects"]
+		if !present {
+			t.Fatalf("provider-run START omitted artifact_subjects: %s", payload)
+		}
+		var decoded []reviewtransaction.ArtifactSubject
+		if err := json.Unmarshal(subjects, &decoded); err != nil || len(decoded) != 0 {
+			t.Fatalf("provider-run START artifact subjects = %s, %v", subjects, err)
+		}
+	})
+
+	t.Run("reviewing authority keeps every reviewing-only field", func(t *testing.T) {
+		legacy := reviewFacadeStartResultFor("created", true, reviewing.State)
+		result, err := newReviewIntegrationStartResult(legacy, assessment, reviewing.State.InitialSnapshot.Kind, &frozen, created.RepositoryContext, created.NextTransition, ReviewIntegrationContractV2)
+		if err != nil {
+			t.Fatalf("reviewing START envelope: %v", err)
+		}
+		if result.RepositoryContext == nil || result.NextTransition == nil ||
+			len(result.ArtifactSubjects) != len(result.SelectedLenses) || len(result.SelectedLenses) != len(created.SelectedLenses) {
+			t.Fatalf("reviewing START lost its reviewing-only fields = %#v", result)
+		}
+		if !reflect.DeepEqual(result.RepositoryContext, created.RepositoryContext) ||
+			!reflect.DeepEqual(result.NextTransition, created.NextTransition) ||
+			!reflect.DeepEqual(result.ArtifactSubjects, created.ArtifactSubjects) {
+			t.Fatalf("reviewing START changed its reviewing-only fields = %#v", result)
+		}
+	})
+}
+
 func runNegotiatedReviewStart(t *testing.T, repo, lineage string) ReviewIntegrationStartResult {
 	t.Helper()
 	return runNegotiatedReviewStartWith(t, repo, lineage)
